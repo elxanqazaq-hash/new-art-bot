@@ -22,16 +22,6 @@ OWNER_ID = str(os.environ.get("OWNER_ID", ""))
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-# Сессия, которая НЕ переиспользует зависшие соединения (важно при работе через прокси)
-def _make_session():
-    s = requests.Session()
-    s.headers.update({"Connection": "close"})
-    adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
-    s.mount("https://", adapter)
-    return s
-
-http = _make_session()
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 KZ_OFFSET = datetime.timedelta(hours=5)  # Казахстан UTC+5
 
@@ -105,7 +95,7 @@ def available_arts():
 
 def api(method, **kwargs):
     try:
-        return http.post(f"{API_URL}/{method}", timeout=(10,30), **kwargs).json()
+        return requests.post(f"{API_URL}/{method}", timeout=30, **kwargs).json()
     except Exception as e:
         print(f"API error {method}: {e}")
         return {}
@@ -131,7 +121,7 @@ def answer_callback(callback_id, text=""):
 
 def send_photo_path(chat_id, path, caption=""):
     with open(path, "rb") as photo:
-        return http.post(
+        return requests.post(
             f"{API_URL}/sendPhoto",
             data={"chat_id": chat_id, "caption": caption},
             files={"photo": photo},
@@ -144,7 +134,7 @@ def send_photo_with_keyboard(chat_id, path, caption="", keyboard=None):
         data = {"chat_id": chat_id, "caption": caption}
         if keyboard is not None:
             data["reply_markup"] = json.dumps(keyboard)
-        return http.post(
+        return requests.post(
             f"{API_URL}/sendPhoto",
             data=data,
             files={"photo": photo},
@@ -497,10 +487,10 @@ def main():
     offset = None
     while True:
         try:
-            params = {"timeout": 20}
+            params = {"timeout": 30}
             if offset is not None:
                 params["offset"] = offset
-            resp = http.get(f"{API_URL}/getUpdates", params=params, timeout=(10,35)).json()
+            resp = requests.get(f"{API_URL}/getUpdates", params=params, timeout=40).json()
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
                 if "message" in upd:
