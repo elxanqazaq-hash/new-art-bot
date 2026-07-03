@@ -22,6 +22,16 @@ OWNER_ID = str(os.environ.get("OWNER_ID", ""))
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
+# Сессия, которая НЕ переиспользует зависшие соединения (важно при работе через прокси)
+def _make_session():
+    s = requests.Session()
+    s.headers.update({"Connection": "close"})
+    adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+    s.mount("https://", adapter)
+    return s
+
+http = _make_session()
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 KZ_OFFSET = datetime.timedelta(hours=5)  # Казахстан UTC+5
 
@@ -95,7 +105,7 @@ def available_arts():
 
 def api(method, **kwargs):
     try:
-        return requests.post(f"{API_URL}/{method}", timeout=30, **kwargs).json()
+        return http.post(f"{API_URL}/{method}", timeout=(10,30), **kwargs).json()
     except Exception as e:
         print(f"API error {method}: {e}")
         return {}
@@ -121,9 +131,22 @@ def answer_callback(callback_id, text=""):
 
 def send_photo_path(chat_id, path, caption=""):
     with open(path, "rb") as photo:
-        return requests.post(
+        return http.post(
             f"{API_URL}/sendPhoto",
             data={"chat_id": chat_id, "caption": caption},
+            files={"photo": photo},
+            timeout=60,
+        ).json()
+
+
+def send_photo_with_keyboard(chat_id, path, caption="", keyboard=None):
+    with open(path, "rb") as photo:
+        data = {"chat_id": chat_id, "caption": caption}
+        if keyboard is not None:
+            data["reply_markup"] = json.dumps(keyboard)
+        return http.post(
+            f"{API_URL}/sendPhoto",
+            data=data,
             files={"photo": photo},
             timeout=60,
         ).json()
@@ -316,13 +339,40 @@ def handle_callback(cb):
         edit_message(cid, mid, "⏰ <b>Расписание публикаций</b>\n\nТекущие времена:", schedule_menu())
     elif data == "preview":
         answer_callback(cb_id, "Отправляю превью...")
-        avail = available_arts()[:10]
+        all_avail = available_arts()
+        avail = all_avail[:5]
         if not avail:
             send_message(cid, "Очередь пуста — нет артов, ждущих публикации.")
         else:
-            send_message(cid, f"🖼 Первые {len(avail)} артов в очереди:")
+            total = len(all_avail)
+            send_message(cid, f"🖼 Показываю {len(avail)} из {total} артов в очереди.\n"
+                              f"Под каждым — кнопка удаления, если арт не нужен:")
             for name in avail:
-                send_photo_path(cid, os.path.join(ARTS_DIR, name), caption=name)
+                kb = {"inline_keyboard": [[
+                    {"text": "🗑 Удалить этот арт", "callback_data": f"delart:{name}"}
+                ]]}
+                send_photo_with_keyboard(cid, os.path.join(ARTS_DIR, name), caption=name, keyboard=kb)
+            if total > 5:
+                send_message(cid, f"…и ещё {total-5}. Открой «Показать арты» снова после удаления, "
+                                  f"чтобы увидеть следующие.", back_menu())
+    elif data.startswith("delart:"):
+        name = data.split(":", 1)[1]
+        path = os.path.join(ARTS_DIR, name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                # на всякий случай убираем из posted, если было
+                posted = get_posted()
+                if name in posted:
+                    posted.discard(name)
+                    set_posted(posted)
+                answer_callback(cb_id, "Удалено из очереди")
+                edit_message(cid, mid, f"🗑 Удалён из очереди: {name}")
+            except Exception as e:
+                answer_callback(cb_id, "Ошибка удаления")
+        else:
+            answer_callback(cb_id, "Файл уже удалён")
+            edit_message(cid, mid, f"Этот арт уже был удалён: {name}")
     elif data == "postnow":
         answer_callback(cb_id, "Публикую...")
         ok, info = do_post(reason="вручную")
@@ -447,10 +497,10 @@ def main():
     offset = None
     while True:
         try:
-            params = {"timeout": 30}
+            params = {"timeout": 20}
             if offset is not None:
                 params["offset"] = offset
-            resp = requests.get(f"{API_URL}/getUpdates", params=params, timeout=40).json()
+            resp = http.get(f"{API_URL}/getUpdates", params=params, timeout=(10,35)).json()
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
                 if "message" in upd:
