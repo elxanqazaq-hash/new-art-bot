@@ -298,10 +298,12 @@ def scheduler_loop():
                 hhmm = now.strftime("%H:%M")
                 today_key = now.strftime("%Y-%m-%d") + " " + hhmm
                 if hhmm in cfg["schedule"] and cfg.get("last_posted_slot") != today_key:
-                    do_post(reason="по расписанию", slot=hhmm)
-                    cfg = get_config()
+                    # СНАЧАЛА ставим метку и сохраняем — чтобы повторный заход
+                    # в ту же минуту не опубликовал второй раз
                     cfg["last_posted_slot"] = today_key
                     save_config(cfg)
+                    # и только потом публикуем
+                    do_post(reason="по расписанию", slot=hhmm)
         except Exception as e:
             print(f"scheduler error: {e}")
         time.sleep(20)  # проверка каждые 20 секунд — точность до минуты
