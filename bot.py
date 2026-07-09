@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import random
 import time
@@ -29,6 +30,7 @@ DEFAULT_CONFIG = {
     "schedule": ["10:00", "12:00", "14:00", "16:00", "20:00", "22:00"],
     "paused": False,
     "autoclean": False,
+    "tags": True,          # подписывать посты хэштегом персонажа
     "last_posted_slot": "",
 }
 
@@ -159,6 +161,7 @@ def main_menu():
     cfg = get_config()
     pause_label = "▶️ Возобновить" if cfg["paused"] else "⏸ Пауза"
     clean_label = "🧹 Автоочистка: ВКЛ" if cfg["autoclean"] else "🧹 Автоочистка: выкл"
+    tags_label = "🏷 Теги: ВКЛ" if cfg.get("tags", True) else "🏷 Теги: выкл"
     return {
         "inline_keyboard": [
             [{"text": "📦 Очередь", "callback_data": "queue"},
@@ -167,6 +170,7 @@ def main_menu():
              {"text": "🚀 Опубликовать сейчас", "callback_data": "postnow"}],
             [{"text": "🗑 Очистить опубликованные", "callback_data": "clearposted"}],
             [{"text": clean_label, "callback_data": "toggleclean"}],
+            [{"text": tags_label, "callback_data": "toggletags"}],
             [{"text": pause_label, "callback_data": "togglepause"}],
             [{"text": "🖥 Статус сервера", "callback_data": "status"},
              {"text": "🔄 Перезапуск бота", "callback_data": "restart"}],
@@ -252,6 +256,70 @@ def status_text():
 
 # ==================== ПУБЛИКАЦИЯ ====================
 
+# ==================== РАСПОЗНАВАНИЕ ПЕРСОНАЖА ====================
+
+SAUCENAO_KEY = os.environ.get("SAUCENAO_KEY", "")
+SAUCENAO_URL = "https://saucenao.com/search.php"
+SIMILARITY_THRESHOLD = 80.0   # ниже этого — не доверяем, ставим #tyan
+FALLBACK_TAG = "#tyan"
+
+
+def _clean_character_name(raw):
+    """'makima (chainsaw man), power (...)' -> '#makima'"""
+    first = raw.split(",")[0]                    # берём только первого персонажа
+    first = re.sub(r"\(.*?\)", "", first)        # убираем скобки с тайтлом
+    first = first.strip().lower()
+    first = re.sub(r"[^a-z0-9]+", "_", first)    # пробелы и мусор -> _
+    first = first.strip("_")
+    if not first or len(first) > 40:
+        return None
+    return "#" + first
+
+
+def detect_character(path):
+    """Ищет арт на SauceNAO и возвращает хэштег персонажа. При любой неудаче -> #tyan"""
+    if not SAUCENAO_KEY:
+        return FALLBACK_TAG
+    try:
+        with open(path, "rb") as f:
+            resp = requests.post(
+                SAUCENAO_URL,
+                params={
+                    "output_type": 2,      # json
+                    "api_key": SAUCENAO_KEY,
+                    "db": 999,             # искать по всем базам
+                    "numres": 8,
+                },
+                files={"file": f},
+                timeout=(10, 30),
+            )
+        data = resp.json()
+
+        if data.get("header", {}).get("status", -1) != 0:
+            print(f"saucenao status != 0: {data.get('header')}")
+            return FALLBACK_TAG
+
+        for result in data.get("results", []):
+            try:
+                similarity = float(result["header"]["similarity"])
+            except (KeyError, ValueError):
+                continue
+            if similarity < SIMILARITY_THRESHOLD:
+                continue
+            characters = result.get("data", {}).get("characters")
+            if not characters:
+                continue                    # у этого источника нет тегов персонажей
+            tag = _clean_character_name(characters)
+            if tag:
+                print(f"Распознан: {tag} ({similarity}%)")
+                return tag
+
+        return FALLBACK_TAG
+    except Exception as e:
+        print(f"detect_character error: {e}")
+        return FALLBACK_TAG
+
+
 def do_post(reason="scheduled", slot=""):
     avail = available_arts()
     if not avail:
@@ -263,7 +331,11 @@ def do_post(reason="scheduled", slot=""):
 
     chosen = random.choice(avail)
     path = os.path.join(ARTS_DIR, chosen)
-    res = send_photo_path(CHANNEL, path)
+
+    cfg = get_config()
+    caption = detect_character(path) if cfg.get("tags", True) else ""
+
+    res = send_photo_path(CHANNEL, path, caption=caption)
 
     if res.get("ok"):
         cfg = get_config()
@@ -279,7 +351,8 @@ def do_post(reason="scheduled", slot=""):
             set_posted(posted)
         if OWNER_ID:
             when = kz_now().strftime("%H:%M")
-            send_message(OWNER_ID, f"✅ Опубликовано в {when} ({reason}): {chosen}")
+            tag_info = f"\nТег: {caption}" if caption else ""
+            send_message(OWNER_ID, f"✅ Опубликовано в {when} ({reason}): {chosen}{tag_info}")
         return True, chosen
     else:
         if OWNER_ID:
@@ -388,6 +461,12 @@ def handle_callback(cb):
         cfg["autoclean"] = not cfg["autoclean"]
         save_config(cfg)
         answer_callback(cb_id, "Готово")
+        edit_message(cid, mid, "🎨 <b>Панель управления ботом</b>\n\nВыбери действие:", main_menu())
+    elif data == "toggletags":
+        cfg = get_config()
+        cfg["tags"] = not cfg.get("tags", True)
+        save_config(cfg)
+        answer_callback(cb_id, "Теги включены" if cfg["tags"] else "Теги выключены")
         edit_message(cid, mid, "🎨 <b>Панель управления ботом</b>\n\nВыбери действие:", main_menu())
     elif data == "togglepause":
         cfg = get_config()
