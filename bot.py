@@ -4,7 +4,6 @@ import json
 import random
 import time
 import shutil
-import subprocess
 import threading
 import datetime
 import requests
@@ -34,8 +33,112 @@ DEFAULT_CONFIG = {
     "last_posted_slot": "",
 }
 
-# Временное состояние для пошагового ввода (например, ожидание ввода времени)
 pending_action = {}
+
+# ==================== РАСПОЗНАВАНИЕ ПЕРСОНАЖА ====================
+
+SAUCENAO_KEY = os.environ.get("SAUCENAO_KEY", "")
+SAUCENAO_URL = "https://saucenao.com/search.php"
+GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+SIMILARITY_THRESHOLD = 80.0
+FALLBACK_TAG = "#tyan"
+
+
+def _clean_character_name(raw):
+    first = raw.split(",")[0]
+    first = re.sub(r"\(.*?\)", "", first)
+    first = first.strip().lower()
+    first = re.sub(r"[^a-z0-9]+", "_", first)
+    first = first.strip("_")
+    if not first or len(first) > 40:
+        return None
+    return "#" + first
+
+
+def detect_character_saucenao(path):
+    """Ищет арт на SauceNAO. При неудаче -> #tyan"""
+    if not SAUCENAO_KEY:
+        return FALLBACK_TAG
+    try:
+        with open(path, "rb") as f:
+            resp = requests.post(
+                SAUCENAO_URL,
+                params={"output_type": 2, "api_key": SAUCENAO_KEY, "db": 999, "numres": 8},
+                files={"file": f},
+                timeout=(10, 30),
+            )
+        data = resp.json()
+        if data.get("header", {}).get("status", -1) != 0:
+            print(f"saucenao status != 0: {data.get('header')}")
+            return FALLBACK_TAG
+        for result in data.get("results", []):
+            try:
+                similarity = float(result["header"]["similarity"])
+            except (KeyError, ValueError):
+                continue
+            if similarity < SIMILARITY_THRESHOLD:
+                continue
+            characters = result.get("data", {}).get("characters")
+            if not characters:
+                continue
+            tag = _clean_character_name(characters)
+            if tag:
+                print(f"Распознан SauceNAO: {tag} ({similarity}%)")
+                return tag
+        return FALLBACK_TAG
+    except Exception as e:
+        print(f"detect_character_saucenao error: {e}")
+        return FALLBACK_TAG
+
+
+def gemini_detect_character(path):
+    """Резерв: спрашиваем у Gemini Flash, кто на арте. При неудаче -> #tyan"""
+    if not GEMINI_KEY:
+        return FALLBACK_TAG
+    try:
+        import base64
+        with open(path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        prompt = (
+            "Look at this anime/game fan art. If you can identify the specific "
+            "character depicted, reply with ONLY their name in English, lowercase, "
+            "words separated by underscores (example: makima). "
+            "If you are not confident or cannot identify a specific named character, "
+            "reply with exactly: unknown"
+        )
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
+                ]
+            }]
+        }
+        resp = requests.post(GEMINI_URL, params={"key": GEMINI_KEY}, json=payload, timeout=(10, 30))
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip().lower()
+        text = re.sub(r"[^a-z0-9_]+", "_", text).strip("_")
+        if not text or text == "unknown" or len(text) > 40:
+            return FALLBACK_TAG
+        tag = "#" + text
+        print(f"Gemini распознал: {tag}")
+        return tag
+    except Exception as e:
+        print(f"gemini_detect_character error: {e}")
+        return FALLBACK_TAG
+
+
+def detect_character(path):
+    """Каскад: сначала SauceNAO (точнее), если не нашёл - пробуем Gemini, иначе #tyan.
+    Возвращает (тег, источник)."""
+    tag = detect_character_saucenao(path)
+    if tag != FALLBACK_TAG:
+        return tag, "SauceNAO"
+    tag = gemini_detect_character(path)
+    if tag != FALLBACK_TAG:
+        return tag, "Gemini"
+    return FALLBACK_TAG, "не распознано"
 
 
 # ==================== ФАЙЛЫ / КОНФИГ ====================
@@ -155,7 +258,7 @@ def download_file(file_id, dest):
     return True
 
 
-# ==================== КЛАВИАТУРЫ (КНОПКИ) ====================
+# ==================== КЛАВИАТУРЫ ====================
 
 def main_menu():
     cfg = get_config()
@@ -202,7 +305,6 @@ def queue_text():
     used = [f for f in all_arts if f in posted]
     cfg = get_config()
 
-    # место на диске
     total, used_disk, free = shutil.disk_usage(BASE_DIR)
     free_gb = free / (1024**3)
 
@@ -220,7 +322,6 @@ def queue_text():
 
 
 def status_text():
-    # аптайм
     try:
         with open("/proc/uptime") as f:
             up_seconds = float(f.read().split()[0])
@@ -230,7 +331,6 @@ def status_text():
     except Exception:
         uptime = "?"
 
-    # память
     try:
         import psutil
         mem = psutil.virtual_memory()
@@ -245,7 +345,7 @@ def status_text():
     disk_txt = f"{used_disk*100//total}% занято, свободно {free/(1024**3):.1f} ГБ"
 
     return (
-        f"🖥 <b>Статус сервера</b>\n\n"
+        f"🖥 <b>Статус</b>\n\n"
         f"⏱ Аптайм: {uptime}\n"
         f"⚙️ CPU: {cpu_txt}\n"
         f"🧠 Память: {mem_txt}\n"
@@ -255,70 +355,6 @@ def status_text():
 
 
 # ==================== ПУБЛИКАЦИЯ ====================
-
-# ==================== РАСПОЗНАВАНИЕ ПЕРСОНАЖА ====================
-
-SAUCENAO_KEY = os.environ.get("SAUCENAO_KEY", "")
-SAUCENAO_URL = "https://saucenao.com/search.php"
-SIMILARITY_THRESHOLD = 80.0   # ниже этого — не доверяем, ставим #tyan
-FALLBACK_TAG = "#tyan"
-
-
-def _clean_character_name(raw):
-    """'makima (chainsaw man), power (...)' -> '#makima'"""
-    first = raw.split(",")[0]                    # берём только первого персонажа
-    first = re.sub(r"\(.*?\)", "", first)        # убираем скобки с тайтлом
-    first = first.strip().lower()
-    first = re.sub(r"[^a-z0-9]+", "_", first)    # пробелы и мусор -> _
-    first = first.strip("_")
-    if not first or len(first) > 40:
-        return None
-    return "#" + first
-
-
-def detect_character(path):
-    """Ищет арт на SauceNAO и возвращает хэштег персонажа. При любой неудаче -> #tyan"""
-    if not SAUCENAO_KEY:
-        return FALLBACK_TAG
-    try:
-        with open(path, "rb") as f:
-            resp = requests.post(
-                SAUCENAO_URL,
-                params={
-                    "output_type": 2,      # json
-                    "api_key": SAUCENAO_KEY,
-                    "db": 999,             # искать по всем базам
-                    "numres": 8,
-                },
-                files={"file": f},
-                timeout=(10, 30),
-            )
-        data = resp.json()
-
-        if data.get("header", {}).get("status", -1) != 0:
-            print(f"saucenao status != 0: {data.get('header')}")
-            return FALLBACK_TAG
-
-        for result in data.get("results", []):
-            try:
-                similarity = float(result["header"]["similarity"])
-            except (KeyError, ValueError):
-                continue
-            if similarity < SIMILARITY_THRESHOLD:
-                continue
-            characters = result.get("data", {}).get("characters")
-            if not characters:
-                continue                    # у этого источника нет тегов персонажей
-            tag = _clean_character_name(characters)
-            if tag:
-                print(f"Распознан: {tag} ({similarity}%)")
-                return tag
-
-        return FALLBACK_TAG
-    except Exception as e:
-        print(f"detect_character error: {e}")
-        return FALLBACK_TAG
-
 
 def do_post(reason="scheduled", slot=""):
     avail = available_arts()
@@ -333,14 +369,16 @@ def do_post(reason="scheduled", slot=""):
     path = os.path.join(ARTS_DIR, chosen)
 
     cfg = get_config()
-    caption = detect_character(path) if cfg.get("tags", True) else ""
+    if cfg.get("tags", True):
+        caption, tag_source = detect_character(path)
+    else:
+        caption, tag_source = "", ""
 
     res = send_photo_path(CHANNEL, path, caption=caption)
 
     if res.get("ok"):
         cfg = get_config()
         if cfg["autoclean"]:
-            # удаляем файл сразу и не копим posted
             try:
                 os.remove(path)
             except Exception:
@@ -351,7 +389,7 @@ def do_post(reason="scheduled", slot=""):
             set_posted(posted)
         if OWNER_ID:
             when = kz_now().strftime("%H:%M")
-            tag_info = f"\nТег: {caption}" if caption else ""
+            tag_info = f"\nТег: {caption} (источник: {tag_source})" if caption else ""
             send_message(OWNER_ID, f"✅ Опубликовано в {when} ({reason}): {chosen}{tag_info}")
         return True, chosen
     else:
@@ -371,15 +409,19 @@ def scheduler_loop():
                 hhmm = now.strftime("%H:%M")
                 today_key = now.strftime("%Y-%m-%d") + " " + hhmm
                 if hhmm in cfg["schedule"] and cfg.get("last_posted_slot") != today_key:
-                    # СНАЧАЛА ставим метку и сохраняем — чтобы повторный заход
-                    # в ту же минуту не опубликовал второй раз
+                    # СНАЧАЛА ставим метку - чтобы повторный заход в ту же минуту
+                    # не опубликовал второй раз
                     cfg["last_posted_slot"] = today_key
                     save_config(cfg)
-                    # и только потом публикуем
                     do_post(reason="по расписанию", slot=hhmm)
         except Exception as e:
             print(f"scheduler error: {e}")
-        time.sleep(20)  # проверка каждые 20 секунд — точность до минуты
+            if OWNER_ID:
+                try:
+                    send_message(OWNER_ID, f"⚠️ Ошибка планировщика: {e}")
+                except Exception:
+                    pass
+        time.sleep(20)
 
 
 # ==================== ОБРАБОТКА КНОПОК ====================
@@ -426,21 +468,20 @@ def handle_callback(cb):
         if os.path.exists(path):
             try:
                 os.remove(path)
-                # на всякий случай убираем из posted, если было
                 posted = get_posted()
                 if name in posted:
                     posted.discard(name)
                     set_posted(posted)
                 answer_callback(cb_id, "Удалено из очереди")
                 edit_message(cid, mid, f"🗑 Удалён из очереди: {name}")
-            except Exception as e:
+            except Exception:
                 answer_callback(cb_id, "Ошибка удаления")
         else:
             answer_callback(cb_id, "Файл уже удалён")
             edit_message(cid, mid, f"Этот арт уже был удалён: {name}")
     elif data == "postnow":
         answer_callback(cb_id, "Публикую...")
-        ok, info = do_post(reason="вручную")
+        do_post(reason="вручную")
         edit_message(cid, mid, queue_text(), back_menu())
     elif data == "clearposted":
         posted = get_posted()
@@ -477,7 +518,7 @@ def handle_callback(cb):
     elif data == "restart":
         answer_callback(cb_id, "Перезапускаюсь...")
         send_message(cid, "🔄 Перезапускаю бота...")
-        os._exit(1)  # systemd поднимет заново
+        os._exit(1)
     elif data == "addtime":
         pending_action[cid] = "addtime"
         send_message(cid, "Напиши новое время в формате ЧЧ:ММ (например 09:30):")
@@ -504,7 +545,6 @@ def handle_message(msg):
         send_message(cid, "Этим ботом управляет только владелец.")
         return
 
-    # Ожидание ввода времени
     if pending_action.get(cid) == "addtime" and "text" in msg:
         t = msg["text"].strip()
         try:
@@ -520,7 +560,6 @@ def handle_message(msg):
             send_message(cid, "Неверный формат. Нужно ЧЧ:ММ, например 09:30. Попробуй ещё раз:")
         return
 
-    # Получена картинка
     if "photo" in msg:
         os.makedirs(ARTS_DIR, exist_ok=True)
         fid = msg["photo"][-1]["file_id"]
@@ -532,7 +571,6 @@ def handle_message(msg):
             send_message(cid, "❌ Не удалось сохранить картинку, попробуй ещё раз.")
         return
 
-    # Документ-картинка (если прислали файлом без сжатия)
     if "document" in msg:
         doc = msg["document"]
         name = doc.get("file_name", "")
@@ -546,7 +584,6 @@ def handle_message(msg):
         send_message(cid, "Это не картинка. Пришли изображение.")
         return
 
-    # Текст / команды
     text = msg.get("text", "")
     if text in ("/start", "/menu", "меню", "Меню"):
         send_message(cid, "🎨 <b>Панель управления ботом</b>\n\nВыбери действие:", main_menu())
@@ -561,7 +598,6 @@ def main():
         print("Не заданы BOT_TOKEN / CHANNEL / OWNER_ID")
         return
 
-    # запускаем планировщик в фоне
     threading.Thread(target=scheduler_loop, daemon=True).start()
 
     print("Бот запущен.")
